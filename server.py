@@ -46,13 +46,16 @@ mcp = FastMCP(
 
 
 def _auth_header() -> str:
+    if not API_SECRET:
+        # Older Trading 212 keys have no secret and are sent as-is.
+        return API_KEY
     token = base64.b64encode(f"{API_KEY}:{API_SECRET}".encode()).decode()
     return f"Basic {token}"
 
 
 async def _get(path: str, params: dict[str, Any] | None = None) -> Any:
-    if not API_KEY or not API_SECRET:
-        return {"error": "T212_API_KEY and T212_API_SECRET are not set on the server."}
+    if not API_KEY:
+        return {"error": "T212_API_KEY is not set on the server."}
     clean = {k: v for k, v in (params or {}).items() if v not in (None, "")}
     try:
         async with httpx.AsyncClient(timeout=30) as client:
