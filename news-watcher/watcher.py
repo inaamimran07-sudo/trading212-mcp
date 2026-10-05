@@ -42,6 +42,8 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 MOVE_PCT = float(os.environ.get("MOVE_PCT", "8"))
 SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/128.0 Safari/537.36")
 
@@ -292,7 +294,56 @@ def match_tickers(text):
 
 
 # ------------------------------------------------------------------- alerts
+def tg_chat_id():
+    global TG_CHAT
+    if TG_CHAT or not TG_TOKEN:
+        return TG_CHAT
+    try:
+        d = json.loads(fetch(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"))
+        for u in reversed(d.get("result", [])):
+            m = u.get("message") or u.get("my_chat_member") or {}
+            cid = (m.get("chat") or {}).get("id")
+            if cid:
+                TG_CHAT = str(cid)
+                log("Telegram chat id discovered:", TG_CHAT)
+                break
+    except Exception as e:
+        log("getUpdates failed:", e)
+    return TG_CHAT
+
+
+def push_telegram(title, body, url=None):
+    chat = tg_chat_id()
+    if not chat:
+        state["last_push_error"] = "Telegram: no chat yet - send /start to your bot"
+        return False
+    text = f"{title}\n{body}" + (f"\n{url}" if url else "")
+    data = json.dumps({"chat_id": chat, "text": text[:4000],
+                       "disable_web_page_preview": True}).encode()
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data=data,
+                headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(req, timeout=15).read()
+            return True
+        except Exception as e:
+            state["last_push_error"] = f"Telegram: {e}"
+            log("telegram push failed:", e)
+            time.sleep(3)
+    return False
+
+
 def push(title, body, url=None, priority=4, tags="zap"):
+    if TG_TOKEN:
+        ok = push_telegram(title, body, url)
+        if ok:
+            with lock:
+                state["alerts_sent"].insert(0, {
+                    "at": datetime.now(UK).strftime("%a %H:%M"), "title": title})
+                del state["alerts_sent"][30:]
+            log("PUSHED (telegram):", title)
+            return True
     if not NTFY_TOPIC:
         log("NTFY_TOPIC not set; would push:", title, body)
         return False
@@ -320,6 +371,8 @@ def push(title, body, url=None, priority=4, tags="zap"):
                     pass
             log(f"push attempt {attempt+1} failed:", e, eb)
             state["last_push_error"] = f"{e} {eb}"[:300]
+            if "quota" in eb:
+                break
             time.sleep([3, 10, 30, 0][attempt])
     if ok:
         with lock:
@@ -561,7 +614,7 @@ def loop():
             fn(initial=True, **kw)
         except Exception:
             traceback.print_exc()
-    push("✅ Halal news watcher is running",
+    state["startup_ok"] = push("✅ Halal news watcher is running",
          f"Watching {len(UNIVERSE)} halal stocks ({state['universe_source']}). "
          f"Alerts for takeovers, big news and {MOVE_PCT:.0f}%+ moves, "
          "weekdays 06:00-22:30 UK.", priority=3, tags="white_check_mark")
@@ -576,6 +629,9 @@ def loop():
                 moved_today.clear()
                 if len(seen) > 50000:
                     seen.clear()
+            if not state.get("startup_ok") and tick % 9 == 0 and TG_TOKEN:
+                state["startup_ok"] = push("✅ Halal news watcher is running",
+                                           f"Watching {len(UNIVERSE)} halal stocks. Alerts for takeovers, big news and {MOVE_PCT:.0f}%+ moves, weekdays 06:00-22:30 UK.")
             if active_now():
                 poll_pr()                    # every ~20s
                 poll_google()                # one query per cycle, rotating
@@ -615,6 +671,9 @@ class H(BaseHTTPRequestHandler):
                 "bw": PR_FEEDS[2],
                 "ntfy_health": NTFY_SERVER + "/v1/health",
             }
+            if TG_TOKEN:
+                urls["tg_getMe"] = f"https://api.telegram.org/bot{TG_TOKEN}/getMe"
+                out["tg_chat"] = tg_chat_id()
             for k, u in urls.items():
                 try:
                     b = fetch(u, timeout=20)
