@@ -569,6 +569,35 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = urllib.parse.urlparse(self.path)
+        if p.path == "/debug":
+            qs = urllib.parse.parse_qs(p.query)
+            if qs.get("topic", [""])[0] != NTFY_TOPIC:
+                return self._send(403, {"error": "pass ?topic=<your topic>"})
+            out = {}
+            urls = {
+                "spark_1d": "https://query1.finance.yahoo.com/v8/finance/spark?symbols=PTC,AAPL&range=1d&interval=1d",
+                "spark_5m": "https://query1.finance.yahoo.com/v8/finance/spark?symbols=PTC,AAPL&range=1d&interval=5m",
+                "chart": "https://query1.finance.yahoo.com/v8/finance/chart/PTC?range=1d&interval=5m",
+                "quote_v7": "https://query1.finance.yahoo.com/v7/finance/quote?symbols=PTC",
+                "screener": "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=25",
+                "nasdaq_movers": "https://api.nasdaq.com/api/marketmovers?assetclass=stocks&exchangestatus=currentMarket&limit=20",
+                "nasdaq_quote": "https://api.nasdaq.com/api/quote/PTC/info?assetclass=stocks",
+                "bw": PR_FEEDS[2],
+                "ntfy_health": NTFY_SERVER + "/v1/health",
+            }
+            for k, u in urls.items():
+                try:
+                    b = fetch(u, timeout=20)
+                    out[k] = {"ok": True, "len": len(b), "head": b[:300].decode("utf-8", "ignore")}
+                except Exception as e:
+                    body = ""
+                    if hasattr(e, "read"):
+                        try:
+                            body = e.read()[:200].decode("utf-8", "ignore")
+                        except Exception:
+                            pass
+                    out[k] = {"ok": False, "err": str(e), "body": body}
+            return self._send(200, out)
         if p.path == "/test":
             qs = urllib.parse.parse_qs(p.query)
             if qs.get("topic", [""])[0] != NTFY_TOPIC:
