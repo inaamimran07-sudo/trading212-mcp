@@ -91,7 +91,8 @@ EXCLUDE_TICKERS = {
     "SYY", "USFD", "PFGC", "CASY", "TSN", "HRL", "SFD", "CVS", "CI", "ELV",
     "HUM", "CNC", "MOH", "UNH", "VZ", "T", "TMUS", "BCE", "TU", "VOD", "STZ",
     "BUD", "DEO", "TAP", "SAM", "BF.B", "ABEV", "CCU", "AFRM", "SOFI", "UPST",
-    "COIN", "HOOD", "IBKR", "SCHW", "ICE", "CME", "NDAQ", "CBOE",
+    "COIN", "HOOD", "IBKR", "SCHW", "ICE", "CME", "NDAQ", "CBOE", "MSGS",
+    "MSGE", "SUNB", "DUKB", "BNJ", "AQNB",
 }
 
 # Industries excluded by Shariah business screens (used for the extra
@@ -805,7 +806,7 @@ def loop():
             fn(initial=True, **kw)
         except Exception:
             traceback.print_exc()
-    state["startup_ok"] = push("✅ Halal news watcher is running",
+    state["startup_ok"] = os.environ.get("STARTUP_MSG") != "1" or push("✅ Halal news watcher is running",
          f"Watching {len(UNIVERSE)} halal stocks. "
          f"Alerts for takeovers, big news and {MOVE_PCT:.0f}%+ moves, "
          "weekdays 06:00-22:30 UK.", priority=3, tags="white_check_mark")
@@ -821,7 +822,7 @@ def loop():
                 if len(seen) > 50000:
                     seen.clear()
             if not state.get("startup_ok") and tick % 9 == 0 and TG_TOKEN:
-                state["startup_ok"] = push("✅ Halal news watcher is running",
+                state["startup_ok"] = os.environ.get("STARTUP_MSG") != "1" or push("✅ Halal news watcher is running",
                                            f"Watching {len(UNIVERSE)} halal stocks. Alerts for takeovers, big news and {MOVE_PCT:.0f}%+ moves, weekdays 06:00-22:30 UK.")
             if active_now():
                 poll_pr()                    # every ~20s
