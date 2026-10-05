@@ -294,44 +294,60 @@ def match_tickers(text):
 
 
 # ------------------------------------------------------------------- alerts
-def tg_chat_id():
+def tg_chat_ids():
+    """Comma-separated TELEGRAM_CHAT_ID (personal and/or group chats).
+    Falls back to auto-discovering the most recent chat if none is set."""
     global TG_CHAT
     if TG_CHAT or not TG_TOKEN:
-        return TG_CHAT
+        return [c.strip() for c in TG_CHAT.split(",") if c.strip()]
+    for c in tg_list_chats():
+        TG_CHAT = c["id"]
+        log("Telegram chat id discovered:", TG_CHAT)
+        break
+    return [TG_CHAT] if TG_CHAT else []
+
+
+def tg_list_chats():
+    """Every chat the bot has seen recently (newest first): private chats and groups."""
+    chats, seen_ids = [], set()
     try:
-        d = json.loads(fetch(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"))
+        d = json.loads(fetch(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"
+                             "?allowed_updates=%5B%22message%22%2C%22my_chat_member%22%5D"))
         for u in reversed(d.get("result", [])):
             m = u.get("message") or u.get("my_chat_member") or {}
-            cid = (m.get("chat") or {}).get("id")
-            if cid:
-                TG_CHAT = str(cid)
-                log("Telegram chat id discovered:", TG_CHAT)
-                break
+            c = m.get("chat") or {}
+            if c.get("id") and str(c["id"]) not in seen_ids:
+                seen_ids.add(str(c["id"]))
+                chats.append({"id": str(c["id"]), "type": c.get("type"),
+                              "title": c.get("title") or c.get("first_name")})
     except Exception as e:
         log("getUpdates failed:", e)
-    return TG_CHAT
+    return chats
 
 
 def push_telegram(title, body, url=None):
-    chat = tg_chat_id()
-    if not chat:
+    chats = tg_chat_ids()
+    if not chats:
         state["last_push_error"] = "Telegram: no chat yet - send /start to your bot"
         return False
     text = f"{title}\n{body}" + (f"\n{url}" if url else "")
-    data = json.dumps({"chat_id": chat, "text": text[:4000],
-                       "disable_web_page_preview": True}).encode()
-    for attempt in range(3):
-        try:
-            req = urllib.request.Request(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data=data,
-                headers={"Content-Type": "application/json"}, method="POST")
-            urllib.request.urlopen(req, timeout=15).read()
-            return True
-        except Exception as e:
-            state["last_push_error"] = f"Telegram: {e}"
-            log("telegram push failed:", e)
-            time.sleep(3)
-    return False
+    any_ok = False
+    for chat in chats:
+        data = json.dumps({"chat_id": chat, "text": text[:4000],
+                           "disable_web_page_preview": True}).encode()
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data=data,
+                    headers={"Content-Type": "application/json"}, method="POST")
+                urllib.request.urlopen(req, timeout=15).read()
+                any_ok = True
+                break
+            except Exception as e:
+                state["last_push_error"] = f"Telegram {chat}: {e}"
+                log("telegram push failed:", chat, e)
+                time.sleep(3)
+    return any_ok
 
 
 def push(title, body, url=None, priority=4, tags="zap"):
@@ -680,7 +696,7 @@ class H(BaseHTTPRequestHandler):
             }
             if TG_TOKEN:
                 urls["tg_getMe"] = f"https://api.telegram.org/bot{TG_TOKEN}/getMe"
-                out["tg_chat"] = tg_chat_id()
+                out["tg_chat"] = tg_chat_ids()
             for k, u in urls.items():
                 try:
                     b = fetch(u, timeout=20)
@@ -694,6 +710,11 @@ class H(BaseHTTPRequestHandler):
                             pass
                     out[k] = {"ok": False, "err": str(e), "body": body}
             return self._send(200, out)
+        if p.path == "/chats":
+            qs = urllib.parse.parse_qs(p.query)
+            if qs.get("topic", [""])[0] != NTFY_TOPIC:
+                return self._send(403, {"error": "pass ?topic=<your topic>"})
+            return self._send(200, {"sending_to": tg_chat_ids(), "bot_sees": tg_list_chats()})
         if p.path == "/test":
             qs = urllib.parse.parse_qs(p.query)
             if qs.get("topic", [""])[0] != NTFY_TOPIC:
