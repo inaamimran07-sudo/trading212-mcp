@@ -40,7 +40,11 @@ UK = ZoneInfo("Europe/London")
 HERE = os.path.dirname(os.path.abspath(__file__))
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
-MOVE_PCT = float(os.environ.get("MOVE_PCT", "8"))
+MOVE_PCT = float(os.environ.get("MOVE_PCT", "3"))
+# Alert when a stock first crosses MOVE_PCT, then again at each bigger step.
+MOVE_STEPS = sorted({MOVE_PCT, 8.0, 15.0, 25.0, 40.0, 60.0})
+MOVE_STEPS = [x for x in MOVE_STEPS if x >= MOVE_PCT]
+EXTRA_SCREENED = int(os.environ.get("EXTRA_SCREENED", "300"))
 SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -53,7 +57,35 @@ BDS_EXCLUDE = {
     "INTC", "DELL", "HPQ", "HPE", "CVX", "DIS", "KO", "MCD", "YUM", "QSR",
     "PZZA", "WIX", "TEVA", "LMT", "RTX", "BA", "NOC", "GD", "LHX", "ESLT",
     "CAT", "HON", "PLTR", "RMAX", "SIEGY",
+    # Israeli companies / Israel-headquartered
+    "CHKP", "CYBR", "NICE", "MNDY", "WIX", "SEDG", "ICL", "TSEM", "GLBE",
+    "FVRR", "NVMI", "CAMT", "INMD", "KMDA", "ORA", "TEVA", "ESLT", "CEVA",
+    "NNOX", "PERI", "SPNS", "SMWB", "RDWR", "ALLT", "GILT", "AUDC", "ELBIT",
+    "ZIM", "TARO", "ITRN", "OPRX", "NGMS", "INVZ", "MBLY", "PAYO", "LMND",
+    "RSKD", "TBLA", "CGNT", "SILC", "NVCR", "NYMX",
 }
+
+# Your own picks - always watched (Intel left out: BDS priority target).
+MY_PICKS = {
+    "ASML": "ASML Holding NV", "TSM": "Taiwan Semiconductor Manufacturing",
+    "CELH": "Celsius Holdings Inc", "RIOT": "Riot Platforms Inc",
+    "AAOI": "Applied Optoelectronics Inc", "MRVL": "Marvell Technology Inc",
+    "BYDDY": "BYD Co Ltd", "HIMS": "Hims & Hers Health Inc",
+    "SKHY": "SK Hynix Inc",
+}
+for _t in os.environ.get("MY_PICKS", "").split(","):
+    if ":" in _t:
+        _k, _v = _t.split(":", 1)
+        MY_PICKS[_k.strip().upper()] = _v.strip()
+
+# Industries excluded by Shariah business screens (used for the extra
+# sector-screened list only; ETF lists are already screened by Shariah boards).
+EXCLUDE_INDUSTRY_RE = re.compile(
+    r"bank|insur|financ|invest|broker|lending|credit|mortgage|savings|trust|"
+    r"real estate investment|reit|blank check|casino|gaming|beverages|brew|"
+    r"distill|wine|tobacco|cigar|military|ordnance|defen[cs]e|aerospace|"
+    r"movie|entertainment|broadcast|pay television|hotel|resort|restaurant|"
+    r"meat|poultry|adult|marijuana|cannabis|exchange", re.I)
 
 # Company names too generic to match on their own in headlines.
 NAME_OVERRIDES = {
@@ -113,11 +145,28 @@ NAME_OVERRIDES = {
     "CELH": ["Celsius Holdings", "Celsius shares", "Celsius stock", "Celsius energy drink"],
     "AAOI": ["Applied Optoelectronics", "AAOI"],
     "RIOT": ["Riot Platforms"],
+    "BYDDY": ["BYD"],
+    "HIMS": ["Hims & Hers", "Hims and Hers", "HIMS"],
+    "SKHY": ["SK Hynix", "SK hynix"],
+    "MRVL": ["Marvell"],
+}
+
+COMMON_WORDS = {
+    "target", "block", "arm", "match", "snap", "square", "gap", "visa", "unity",
+    "toast", "dropbox", "zoom", "shift", "ford", "best buy", "intuit", "apple",
+    "oracle", "monster", "flex", "waters", "dover", "carrier", "coherent",
+    "ross", "nucor", "ball", "crown", "graham", "fair", "clear", "global",
+    "general", "american", "united", "national", "first", "pool", "sun",
+    "align", "insulet", "coupang", "kenvue", "everest", "progressive",
+    "public", "premier", "core", "lumen", "rambus", "affirm", "elastic",
 }
 
 SUFFIX_RE = re.compile(
-    r"\b(inc|corp|corporation|co|cos|company|plc|ltd|nv|holdings?|group|"
-    r"the|international|technologies|technology)\b\.?|/the|/de|/md|/ny|[,.]",
+    r"\b(american depositary shares?|depositary shares?|ordinary shares?|"
+    r"common stock|class [a-c]|sponsored adr|adr|ads|each representing.*$|"
+    r"inc|corp|corporation|co|cos|company|plc|ltd|limited|nv|n\.v|s\.a|sa|ag|se|"
+    r"holdings?|group|the|international|technologies|technology)\b\.?|"
+    r"/the|/de|/md|/ny|[,.()]",
     re.I)
 
 CATALYST_RE = re.compile(
@@ -235,46 +284,137 @@ def build_patterns():
     pats = []
     for t, name in UNIVERSE.items():
         if t in NAME_OVERRIDES:
-            aliases = NAME_OVERRIDES[t]
+            aliases, flags = NAME_OVERRIDES[t], re.I
         else:
             sn = short_name(name)
-            aliases = [sn] if len(sn) >= 4 else []
+            if sn.isupper() and len(sn) > 4:
+                sn = sn.title()
+            if len(sn) < 3:
+                continue
+            if sn.lower() in COMMON_WORDS:
+                aliases = [f"{sn} Inc", f"{sn} shares", f"{sn} stock", f"{sn}'s shares"]
+            else:
+                aliases = [sn]
+            flags = 0
         for a in aliases:
             strict = a.isupper() and len(a) <= 4
             pats.append((re.compile(r"(?<![\w-])" + re.escape(a) + r"(?![\w-])",
-                                    0 if strict else re.I), t))
+                                    0 if strict else flags), t))
     NAME_PATTERNS[:] = pats
 
 
+TIER = {}  # ticker -> "etf:SPUS" / "screened" / "yours"
+
+
+def parse_holdings_csv(raw):
+    out = {}
+    rows = list(csv.reader(io.StringIO(raw)))
+    hdr_i = None
+    for i, r in enumerate(rows[:15]):
+        low = [c.lower().strip() for c in r]
+        if any(c in ("ticker", "stockticker", "symbol", "ticker symbol") for c in low):
+            hdr_i = i
+            break
+    if hdr_i is None:
+        return out
+    low = [c.lower().strip() for c in rows[hdr_i]]
+    ti = next(i for i, c in enumerate(low) if c in ("ticker", "stockticker", "symbol", "ticker symbol"))
+    ni = next((i for i, c in enumerate(low) if c in ("securityname", "name", "security name",
+                                                      "company", "description", "holding", "security")), None)
+    for r in rows[hdr_i + 1:]:
+        if len(r) <= ti:
+            continue
+        t = r[ti].strip().upper().replace("/", ".")
+        n = r[ni].strip() if ni is not None and len(r) > ni else t
+        if re.fullmatch(r"[A-Z]{1,5}(\.[A-Z])?", t):
+            out[t] = n or t
+    return out
+
+
+ETF_SOURCES = {
+    "SPUS": "https://www.sp-funds.com/wp-content/uploads/data/TidalFG_Holdings_SPUS.csv",
+    "SPTE": "https://www.sp-funds.com/wp-content/uploads/data/TidalFG_Holdings_SPTE.csv",
+    "HLAL": "https://docs.google.com/spreadsheets/d/1UC1Bk67bGuYsos_i8y_HQpNoHpVHAvqf71MbgrafJOQ/export?format=csv&gid=0",
+}
+
+
+def nasdaq_screened(exclude, limit):
+    """Largest US-listed stocks passing Shariah business-sector screens
+    (financial ratios NOT checked) and not Israeli."""
+    raw = fetch("https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=10000&download=true",
+                timeout=40)
+    rows = json.loads(raw)["data"]["rows"]
+    cands = []
+    for r in rows:
+        sym = (r.get("symbol") or "").strip().upper()
+        if not re.fullmatch(r"[A-Z]{1,5}", sym) or sym in exclude or sym in BDS_EXCLUDE:
+            continue
+        if (r.get("country") or "").strip().lower() == "israel":
+            continue
+        ind = f"{r.get('sector', '')} {r.get('industry', '')}"
+        if not r.get("industry") or EXCLUDE_INDUSTRY_RE.search(ind):
+            continue
+        name = r.get("name") or sym
+        if re.search(r"warrant|right|unit|preferred|notes? due|depositary share.*preferred", name, re.I):
+            continue
+        try:
+            mc = float(r.get("marketCap") or 0)
+        except ValueError:
+            mc = 0
+        if mc < 2e9:
+            continue
+        cands.append((mc, sym, name))
+    cands.sort(reverse=True)
+    return {sym: name for _, sym, name in cands[:limit]}
+
+
 def load_universe():
-    base = json.load(open(os.path.join(HERE, "universe.json")))
-    src = "bundled list"
-    try:
-        raw = fetch("https://www.sp-funds.com/wp-content/uploads/data/"
-                    "TidalFG_Holdings_SPUS.csv", timeout=20).decode("utf-8", "ignore")
-        rows = list(csv.DictReader(io.StringIO(raw)))
-        fresh = {}
-        for r in rows:
-            keys = {k.lower().strip(): v for k, v in r.items() if k}
-            t = (keys.get("stockticker") or keys.get("ticker") or "").strip().upper()
-            n = (keys.get("securityname") or keys.get("name") or "").strip()
-            if t and n and re.fullmatch(r"[A-Z.]{1,6}", t):
-                fresh[t] = n
-        if len(fresh) > 100:
-            extras = {k: v for k, v in base.items()
-                      if k in ("ASML", "TSM", "CELH", "RIOT", "AAOI")}
-            base = {**fresh, **extras}
-            src = "SPUS live holdings"
-    except Exception as e:
-        log("SPUS refresh failed, using bundled list:", e)
+    uni, tier, counts = {}, {}, {}
+    for etf, url in ETF_SOURCES.items():
+        try:
+            got = parse_holdings_csv(fetch(url, timeout=30).decode("utf-8", "ignore"))
+            counts[etf] = len(got)
+            for t, n in got.items():
+                if t not in uni:
+                    uni[t], tier[t] = n, f"etf:{etf}"
+        except Exception as e:
+            counts[etf] = f"failed: {e}"
+            log(f"{etf} holdings failed:", e)
+    if len(uni) < 100:  # fall back to bundled SPUS list
+        for t, n in json.load(open(os.path.join(HERE, "universe.json"))).items():
+            uni.setdefault(t, n)
+            tier.setdefault(t, "etf:SPUS (bundled)")
     for t in BDS_EXCLUDE:
-        base.pop(t, None)
+        uni.pop(t, None)
+    try:
+        extra = nasdaq_screened(set(uni) | set(MY_PICKS), EXTRA_SCREENED)
+        counts["sector-screened"] = len(extra)
+        for t, n in extra.items():
+            uni[t], tier[t] = n, "screened"
+    except Exception as e:
+        counts["sector-screened"] = f"failed: {e}"
+        log("nasdaq screen failed:", e)
+    for t, n in MY_PICKS.items():
+        if t not in BDS_EXCLUDE:
+            uni[t] = n
+            tier[t] = "yours" if t not in tier or tier[t] == "screened" else tier[t] + "+yours"
     UNIVERSE.clear()
-    UNIVERSE.update(base)
+    UNIVERSE.update(uni)
+    TIER.clear()
+    TIER.update(tier)
     build_patterns()
     state["universe_size"] = len(UNIVERSE)
-    state["universe_source"] = src
-    log(f"Universe: {len(UNIVERSE)} stocks ({src})")
+    state["universe_source"] = counts
+    log(f"Universe: {len(UNIVERSE)} stocks {counts}")
+
+
+def tier_note(t):
+    tr = TIER.get(t, "")
+    if tr.startswith("etf:"):
+        return f"✅ In Shariah ETF ({tr[4:].replace('+yours', '')})"
+    if tr == "screened":
+        return "⚠️ Sector-screened only - check debt ratios on Musaffa/Zoya"
+    return "⭐ Your pick - check Musaffa/Zoya"
 
 
 def match_tickers(text):
@@ -432,7 +572,7 @@ def alert_news(tickers, item, kind):
         if n:
             body += f"\n{n}"
         src = item.get("source") or kind
-        body += f"\n({src}) Check Musaffa/Zoya before buying. Not advice."
+        body += f"\n({src}) {tier_note(t)}. Not advice."
         push(title, body, item["link"], priority=5 if TAKEOVER_RE.search(text) else 4)
 
 
@@ -570,6 +710,13 @@ def poll_moves(initial=False):
         allq = yahoo_screener()
         got = {t: q for t, q in allq.items() if t in UNIVERSE}
         mark("PriceMoves", True, f"screener: {len(allq)} movers, {len(got)} halal")
+        picks = [t for t in MY_PICKS if t in UNIVERSE]
+        for i in range(0, len(picks), 10):
+            try:
+                for t, q in yahoo_spark(picks[i:i + 10]).items():
+                    got.setdefault(t, q)
+            except Exception:
+                pass
     except Exception as e:
         last_err = e
         syms = sorted(UNIVERSE)
@@ -591,7 +738,7 @@ def poll_moves(initial=False):
         pct = q["pct"]
         if abs(pct) < MOVE_PCT:
             continue
-        bucket = int(abs(pct) // MOVE_PCT)  # re-alert at 8%, 16%, 24%...
+        bucket = sum(1 for x in MOVE_STEPS if abs(pct) >= x)  # 3%, 8%, 15%, 25%...
         prev = moved_today.get(t)
         if prev and prev[0] == today and prev[1] >= bucket:
             continue
@@ -606,7 +753,7 @@ def poll_moves(initial=False):
         n = note_for(head or "")
         if n:
             body += f"\n{n}"
-        body += "\nCheck Musaffa/Zoya before buying. Not advice."
+        body += f"\n{tier_note(t)}. Not advice."
         push(title, body, link, priority=5 if abs(pct) >= 15 else 4,
              tags="chart_with_upwards_trend" if pct > 0 else "chart_with_downwards_trend")
 
@@ -638,7 +785,7 @@ def loop():
         except Exception:
             traceback.print_exc()
     state["startup_ok"] = push("✅ Halal news watcher is running",
-         f"Watching {len(UNIVERSE)} halal stocks ({state['universe_source']}). "
+         f"Watching {len(UNIVERSE)} halal stocks. "
          f"Alerts for takeovers, big news and {MOVE_PCT:.0f}%+ moves, "
          "weekdays 06:00-22:30 UK.", priority=3, tags="white_check_mark")
     tick = 0
@@ -710,6 +857,19 @@ class H(BaseHTTPRequestHandler):
                             pass
                     out[k] = {"ok": False, "err": str(e), "body": body}
             return self._send(200, out)
+        if p.path == "/universe":
+            qs = urllib.parse.parse_qs(p.query)
+            check = [x.strip().upper() for x in qs.get("check", [""])[0].split(",") if x.strip()]
+            by_tier = {}
+            for t, tr in TIER.items():
+                by_tier[tr] = by_tier.get(tr, 0) + 1
+            return self._send(200, {
+                "total": len(UNIVERSE), "sources": state["universe_source"],
+                "by_tier": by_tier, "move_steps": MOVE_STEPS,
+                "check": {c: (TIER.get(c) or ("BDS-excluded" if c in BDS_EXCLUDE else "not in list"))
+                          for c in check},
+                "screened_sample": sorted(t for t, tr in TIER.items() if tr == "screened")[:400],
+            })
         if p.path == "/chats":
             qs = urllib.parse.parse_qs(p.query)
             if qs.get("topic", [""])[0] != NTFY_TOPIC:
