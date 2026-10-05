@@ -140,7 +140,6 @@ TAKEOVER_RE = re.compile(
 PR_FEEDS = [
     "https://www.prnewswire.com/rss/news-releases-list.rss",
     "https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies",
-    "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRWQ==",
 ]
 
 GN_QUERIES = [
@@ -297,27 +296,38 @@ def push(title, body, url=None, priority=4, tags="zap"):
     if not NTFY_TOPIC:
         log("NTFY_TOPIC not set; would push:", title, body)
         return False
-    headers = {
-        "Title": title.encode("utf-8").decode("latin-1", "ignore")[:200],
-        "Priority": str(priority),
-        "Tags": tags,
-    }
+    payload = {"topic": NTFY_TOPIC, "title": title[:200], "message": body,
+               "priority": priority, "tags": [tags]}
     if url:
-        headers["Click"] = url
-    req = urllib.request.Request(f"{NTFY_SERVER}/{NTFY_TOPIC}",
-                                 data=body.encode("utf-8"), headers=headers,
+        payload["click"] = url
+    req = urllib.request.Request(NTFY_SERVER + "/",
+                                 data=json.dumps(payload).encode("utf-8"),
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": UA},
                                  method="POST")
-    try:
-        urllib.request.urlopen(req, timeout=15).read()
+    ok = False
+    for attempt in range(4):
+        try:
+            urllib.request.urlopen(req, timeout=15).read()
+            ok = True
+            break
+        except Exception as e:
+            eb = ""
+            if hasattr(e, "read"):
+                try:
+                    eb = e.read()[:200].decode("utf-8", "ignore")
+                except Exception:
+                    pass
+            log(f"push attempt {attempt+1} failed:", e, eb)
+            state["last_push_error"] = f"{e} {eb}"[:300]
+            time.sleep([3, 10, 30, 0][attempt])
+    if ok:
         with lock:
             state["alerts_sent"].insert(0, {
                 "at": datetime.now(UK).strftime("%a %H:%M"), "title": title})
             del state["alerts_sent"][30:]
         log("PUSHED:", title)
-        return True
-    except Exception as e:
-        log("push failed:", e)
-        return False
+    return ok
 
 
 def quote_line(t):
@@ -367,7 +377,7 @@ def poll_pr(initial=False):
     for url in PR_FEEDS:
         name = "PR:" + urllib.parse.urlparse(url).netloc
         try:
-            items = parse_rss(fetch(url))
+            items = parse_rss(fetch(url, timeout=30))
             mark(name, True, f"{len(items)} items")
         except Exception as e:
             mark(name, False, e)
@@ -419,29 +429,43 @@ def poll_google(initial=False, queries=None):
 last_quotes = {}
 
 
-def yahoo_spark(symbols):
+def yahoo_screener():
+    """Market-wide top gainers + losers in one or two calls (includes pre-market)."""
     out = {}
-    err = "empty"
-    for host in ("query1", "query2"):
-        try:
-            url = (f"https://{host}.finance.yahoo.com/v8/finance/spark?"
-                   f"symbols={','.join(symbols)}&range=1d&interval=5m"
-                   f"&includePrePost=true")
-            data = json.loads(fetch(url))
-            for r in data.get("spark", {}).get("result", []) or []:
-                resp = (r.get("response") or [{}])[0]
-                meta = resp.get("meta", {})
-                closes = [c for c in (resp.get("indicators", {}).get("quote", [{}])[0]
-                                      .get("close") or []) if c]
-                prev = meta.get("chartPreviousClose") or meta.get("previousClose")
-                price = closes[-1] if closes else meta.get("regularMarketPrice")
-                if prev and price:
-                    out[r["symbol"]] = {"price": price, "pct": (price / prev - 1) * 100}
-            if out:
-                return out
-        except Exception as e:
-            err = e
-    raise RuntimeError(f"spark failed: {err}")
+    for scr in ("day_gainers", "day_losers"):
+        url = ("https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?"
+               f"scrIds={scr}&count=250")
+        data = json.loads(fetch(url, timeout=20))
+        for q in data["finance"]["result"][0]["quotes"]:
+            sym = q.get("symbol")
+            pct = q.get("regularMarketChangePercent")
+            price = q.get("regularMarketPrice")
+            if q.get("marketState") == "PRE" and q.get("preMarketChangePercent") is not None:
+                pct, price = q["preMarketChangePercent"], q.get("preMarketPrice", price)
+            elif q.get("marketState") in ("POST", "POSTPOST") and q.get("postMarketChangePercent") is not None:
+                # after-hours move on top of the day's move
+                base = q.get("regularMarketPreviousClose")
+                if base and q.get("postMarketPrice"):
+                    price = q["postMarketPrice"]
+                    pct = (price / base - 1) * 100
+            if sym and pct is not None and price:
+                out[sym] = {"price": float(price), "pct": float(pct)}
+    return out
+
+
+def yahoo_spark(symbols):
+    url = ("https://query1.finance.yahoo.com/v8/finance/spark?"
+           f"symbols={','.join(symbols)}&range=1d&interval=5m")
+    data = json.loads(fetch(url))
+    out = {}
+    for sym, r in data.items():
+        if not isinstance(r, dict):
+            continue
+        closes = [c for c in (r.get("close") or []) if c]
+        prev = r.get("chartPreviousClose") or r.get("previousClose")
+        if prev and closes:
+            out[sym] = {"price": closes[-1], "pct": (closes[-1] / prev - 1) * 100}
+    return out
 
 
 def latest_headline(ticker):
@@ -463,22 +487,28 @@ def latest_headline(ticker):
 
 
 def poll_moves(initial=False):
-    syms = sorted(UNIVERSE)
     got = {}
     errors = 0
     last_err = None
-    for i in range(0, len(syms), 20):
-        try:
-            got.update(yahoo_spark(syms[i:i + 20]))
-        except Exception as e:
-            errors += 1
-            last_err = e
-        time.sleep(0.3)
-    if got:
-        mark("PriceMoves", True, f"{len(got)} quotes, {errors} failed batches")
-    else:
-        mark("PriceMoves", False, last_err if errors else "no data")
-        return
+    try:
+        allq = yahoo_screener()
+        got = {t: q for t, q in allq.items() if t in UNIVERSE}
+        mark("PriceMoves", True, f"screener: {len(allq)} movers, {len(got)} halal")
+    except Exception as e:
+        last_err = e
+        syms = sorted(UNIVERSE)
+        for i in range(0, len(syms), 10):
+            try:
+                got.update(yahoo_spark(syms[i:i + 10]))
+            except Exception as e2:
+                errors += 1
+                last_err = e2
+            time.sleep(0.3)
+        if got:
+            mark("PriceMoves", True, f"spark fallback: {len(got)} quotes, {errors} failed")
+        else:
+            mark("PriceMoves", False, last_err)
+            return
     last_quotes.update(got)
     today = datetime.now(UK).date()
     for t, q in got.items():
