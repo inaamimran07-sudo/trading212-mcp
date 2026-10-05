@@ -675,7 +675,7 @@ class H(BaseHTTPRequestHandler):
                 "screener": "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=25",
                 "nasdaq_movers": "https://api.nasdaq.com/api/marketmovers?assetclass=stocks&exchangestatus=currentMarket&limit=20",
                 "nasdaq_quote": "https://api.nasdaq.com/api/quote/PTC/info?assetclass=stocks",
-                "bw": PR_FEEDS[2],
+                "globe": PR_FEEDS[1],
                 "ntfy_health": NTFY_SERVER + "/v1/health",
             }
             if TG_TOKEN:
