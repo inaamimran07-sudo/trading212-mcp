@@ -426,14 +426,21 @@ def fresh(item, minutes=90):
     return d is None or d > datetime.now(timezone.utc) - timedelta(minutes=minutes)
 
 
+backoff = {}
+
+
 def poll_pr(initial=False):
     for url in PR_FEEDS:
         name = "PR:" + urllib.parse.urlparse(url).netloc
+        if time.time() < backoff.get(name, 0):
+            continue
         try:
-            items = parse_rss(fetch(url, timeout=30))
+            items = parse_rss(fetch(url, timeout=12))
             mark(name, True, f"{len(items)} items")
+            backoff.pop(name, None)
         except Exception as e:
-            mark(name, False, e)
+            mark(name, False, f"{e} (retry in 5 min)")
+            backoff[name] = time.time() + 300
             continue
         for it in items:
             gid = ("pr", it["guid"])
