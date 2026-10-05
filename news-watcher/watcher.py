@@ -78,6 +78,22 @@ for _t in os.environ.get("MY_PICKS", "").split(","):
         _k, _v = _t.split(":", 1)
         MY_PICKS[_k.strip().upper()] = _v.strip()
 
+# Known non-compliant names the sector data misses (tobacco, gambling,
+# cruise/alcohol, payments/interest, asset managers, defence, health
+# insurers, pork/alcohol food distributors, entertainment, high-debt telecom).
+EXCLUDE_TICKERS = {
+    "MO", "PM", "BTI", "IMBBY", "CCL", "RCL", "NCLH", "VIK", "FLUT", "DKNG",
+    "LVS", "WYNN", "MGM", "CZR", "LYV", "NFLX", "TKO", "WMG", "SONY", "SPOT",
+    "WBD", "PARA", "FOXA", "FOX", "CMCSA", "CHTR", "MA", "V", "PYPL", "FIS",
+    "FISV", "FI", "GPN", "CPAY", "XYZ", "SQ", "SSNC", "MSCI", "SPGI", "MCO",
+    "BAM", "BN", "BX", "KKR", "APO", "FTAI", "CACI", "LDOS", "HWM", "TDY",
+    "WWD", "GE", "HII", "TXT", "KTOS", "AVAV", "SAIC", "BWXT", "SPCX", "KHC",
+    "SYY", "USFD", "PFGC", "CASY", "TSN", "HRL", "SFD", "CVS", "CI", "ELV",
+    "HUM", "CNC", "MOH", "UNH", "VZ", "T", "TMUS", "BCE", "TU", "VOD", "STZ",
+    "BUD", "DEO", "TAP", "SAM", "BF.B", "ABEV", "CCU", "AFRM", "SOFI", "UPST",
+    "COIN", "HOOD", "IBKR", "SCHW", "ICE", "CME", "NDAQ", "CBOE",
+}
+
 # Industries excluded by Shariah business screens (used for the extra
 # sector-screened list only; ETF lists are already screened by Shariah boards).
 EXCLUDE_INDUSTRY_RE = re.compile(
@@ -85,7 +101,9 @@ EXCLUDE_INDUSTRY_RE = re.compile(
     r"real estate investment|reit|blank check|casino|gaming|beverages|brew|"
     r"distill|wine|tobacco|cigar|military|ordnance|defen[cs]e|aerospace|"
     r"movie|entertainment|broadcast|pay television|hotel|resort|restaurant|"
-    r"meat|poultry|adult|marijuana|cannabis|exchange", re.I)
+    r"meat|poultry|adult|marijuana|cannabis|exchange|electric utilit|"
+    r"power generation|gas distribution|water supply|cruise|"
+    r"packaged foods|food distributors|telecommunications services", re.I)
 
 # Company names too generic to match on their own in headlines.
 NAME_OVERRIDES = {
@@ -347,7 +365,8 @@ def nasdaq_screened(exclude, limit):
     cands = []
     for r in rows:
         sym = (r.get("symbol") or "").strip().upper()
-        if not re.fullmatch(r"[A-Z]{1,5}", sym) or sym in exclude or sym in BDS_EXCLUDE:
+        if (not re.fullmatch(r"[A-Z]{1,5}", sym) or sym in exclude
+                or sym in BDS_EXCLUDE or sym in EXCLUDE_TICKERS):
             continue
         if (r.get("country") or "").strip().lower() == "israel":
             continue
@@ -355,7 +374,8 @@ def nasdaq_screened(exclude, limit):
         if not r.get("industry") or EXCLUDE_INDUSTRY_RE.search(ind):
             continue
         name = r.get("name") or sym
-        if re.search(r"warrant|right|unit|preferred|notes? due|depositary share.*preferred", name, re.I):
+        if re.search(r"warrant|right|unit|preferred|notes? due|note|debenture|"
+                     r"subordinated|%|depositary share.*preferred", name, re.I):
             continue
         try:
             mc = float(r.get("marketCap") or 0)
@@ -386,6 +406,7 @@ def load_universe():
             tier.setdefault(t, "etf:SPUS (bundled)")
     for t in BDS_EXCLUDE:
         uni.pop(t, None)
+        tier.pop(t, None)
     try:
         extra = nasdaq_screened(set(uni) | set(MY_PICKS), EXTRA_SCREENED)
         counts["sector-screened"] = len(extra)
@@ -866,7 +887,8 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, {
                 "total": len(UNIVERSE), "sources": state["universe_source"],
                 "by_tier": by_tier, "move_steps": MOVE_STEPS,
-                "check": {c: (TIER.get(c) or ("BDS-excluded" if c in BDS_EXCLUDE else "not in list"))
+                "check": {c: ("BDS-excluded" if c in BDS_EXCLUDE else
+                              (TIER.get(c) if c in UNIVERSE else "not in list"))
                           for c in check},
                 "screened_sample": sorted(t for t, tr in TIER.items() if tr == "screened")[:400],
             })
