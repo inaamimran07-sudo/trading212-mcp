@@ -1,0 +1,592 @@
+"""
+Halal breaking-news watcher.
+
+Polls fast news sources every few seconds, keeps only news about stocks on the
+halal list (SP Funds SPUS Shariah holdings + your own stocks, minus BDS
+boycott targets), and pushes a phone alert via ntfy within ~1 minute.
+
+Sources:
+  1. Press-release wires (PR Newswire, GlobeNewswire, Business Wire) - official
+     deal/guidance announcements, matched by "(NASDAQ: PTC)" style tags.
+  2. Google News search RSS - "reportedly in talks", takeover, surge/plunge
+     headlines from Reuters/Bloomberg/CNBC etc, matched by company name.
+  3. Price moves - any halal stock moving >= MOVE_PCT% vs previous close,
+     with the latest headline attached as the reason.
+
+Env vars:
+  NTFY_TOPIC   (required) secret ntfy topic name your phone subscribes to
+  NTFY_SERVER  default https://ntfy.sh
+  MOVE_PCT     default 8
+  PORT         set by Render
+"""
+import csv
+import html
+import io
+import json
+import os
+import re
+import threading
+import time
+import traceback
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from zoneinfo import ZoneInfo
+
+UK = ZoneInfo("Europe/London")
+HERE = os.path.dirname(os.path.abspath(__file__))
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
+NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+MOVE_PCT = float(os.environ.get("MOVE_PCT", "8"))
+SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/128.0 Safari/537.36")
+
+# Boycott / BDS exclusions (also applied to SPUS refreshes).
+BDS_EXCLUDE = {
+    "MSFT", "GOOGL", "GOOG", "CSCO", "PEP", "BKNG", "EXPE", "ABNB", "AMZN",
+    "INTC", "DELL", "HPQ", "HPE", "CVX", "DIS", "KO", "MCD", "YUM", "QSR",
+    "PZZA", "WIX", "TEVA", "LMT", "RTX", "BA", "NOC", "GD", "LHX", "ESLT",
+    "CAT", "HON", "PLTR", "RMAX", "SIEGY",
+}
+
+# Company names too generic to match on their own in headlines.
+NAME_OVERRIDES = {
+    "TGT": ["Target Corp", "Target's sales", "Target shares", "Target stock"],
+    "FLEX": ["Flex Ltd", "Flex shares", "Flex stock"],
+    "WAT": ["Waters Corp", "Waters shares", "Waters stock"],
+    "DOV": ["Dover Corp", "Dover shares", "Dover stock"],
+    "CARR": ["Carrier Global", "Carrier shares", "Carrier stock"],
+    "ON": ["ON Semiconductor", "onsemi"],
+    "A": ["Agilent"],
+    "P": ["Everpure"],
+    "Q": ["Qnity"],
+    "IT": ["Gartner"],
+    "NOW": ["ServiceNow"],
+    "BE": ["Bloom Energy"],
+    "COR": ["Cencora"],
+    "FIX": ["Comfort Systems"],
+    "TECH": ["Bio-Techne"],
+    "FAST": ["Fastenal"],
+    "ALL": [],
+    "MMM": ["3M"],
+    "HD": ["Home Depot"],
+    "LOW": ["Lowe's"],
+    "GLW": ["Corning"],
+    "TSM": ["TSMC", "Taiwan Semiconductor"],
+    "ASML": ["ASML"],
+    "PTC": ["PTC Inc", "PTC shares", "PTC stock", "of PTC", "PTC's"],
+    "EL": ["Estee Lauder", "Estée Lauder"],
+    "CRH": ["CRH"],
+    "UPS": ["UPS", "United Parcel"],
+    "IBM": ["IBM"],
+    "AMD": ["AMD", "Advanced Micro Devices"],
+    "TT": ["Trane"],
+    "WM": ["Waste Management"],
+    "CL": ["Colgate"],
+    "PG": ["Procter & Gamble", "P&G"],
+    "JNJ": ["Johnson & Johnson", "J&J"],
+    "LLY": ["Eli Lilly", "Lilly"],
+    "MRK": ["Merck"],
+    "SLB": ["SLB", "Schlumberger"],
+    "GE": [],
+    "GEV": ["GE Vernova"],
+    "GEHC": ["GE HealthCare"],
+    "DD": ["DuPont"],
+    "CF": ["CF Industries"],
+    "RL": ["Ralph Lauren"],
+    "NKE": ["Nike"],
+    "ROL": ["Rollins Inc"],
+    "OTIS": ["Otis Worldwide", "Otis shares", "Otis stock"],
+    "COO": ["Cooper Cos", "CooperCompanies"],
+    "COHR": ["Coherent Corp", "Coherent shares", "Coherent stock"],
+    "KLAC": ["KLA"],
+    "CSX": ["CSX"],
+    "CDW": ["CDW"],
+    "FFIV": ["F5 Inc", "F5 Networks", "F5 shares"],
+    "EOG": ["EOG Resources", "EOG"],
+    "CELH": ["Celsius Holdings", "Celsius shares", "Celsius stock", "Celsius energy drink"],
+    "AAOI": ["Applied Optoelectronics", "AAOI"],
+    "RIOT": ["Riot Platforms"],
+}
+
+SUFFIX_RE = re.compile(
+    r"\b(inc|corp|corporation|co|cos|company|plc|ltd|nv|holdings?|group|"
+    r"the|international|technologies|technology)\b\.?|/the|/de|/md|/ny|[,.]",
+    re.I)
+
+CATALYST_RE = re.compile(
+    r"definitive agreement|acquir|acquisition|takeover|take-over|buyout|buy-out|merger|merge |"
+    r"to be bought|to buy |agrees? to buy|in talks|nears? deal|close to (a )?deal|"
+    r"bid for|offer for|tender offer|go(ing)? private|strategic alternatives|"
+    r"explor(es|ing) (a )?sale|activist|stake in|"
+    r"soar|surge|jump|skyrocket|rocket|rall(y|ies)|plunge|tumble|sink|crater|"
+    r"plummet|slump|nosedive|"
+    r"raises? (its )?(guidance|outlook|forecast)|cuts? (its )?(guidance|outlook|forecast)|"
+    r"lowers? (its )?(guidance|outlook|forecast)|preliminary|pre-announce|"
+    r"beats? estimates|misses estimates|record revenue|profit warning|"
+    r"fda approv|approval|clears|wins? .{0,30}contract|awarded|billion deal|"
+    r"partnership with|downgrade|upgrade|halted|investigation|probe|recall|"
+    r"bankrupt|resign|steps down|ceo departs", re.I)
+
+TAKEOVER_RE = re.compile(
+    r"acquir|takeover|take-over|buyout|merger|to be bought|to buy|in talks|"
+    r"nears? deal|bid for|offer for|tender offer|go(ing)? private|explor\w+ (a )?sale",
+    re.I)
+
+PR_FEEDS = [
+    "https://www.prnewswire.com/rss/news-releases-list.rss",
+    "https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies",
+    "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRWQ==",
+]
+
+GN_QUERIES = [
+    "takeover OR acquire OR acquisition OR buyout OR \"in talks\" stock when:1h",
+    "shares soar OR surge OR jump OR skyrocket when:1h",
+    "shares plunge OR tumble OR sink OR crater when:1h",
+    "raises guidance OR cuts guidance OR preliminary results shares when:1h",
+    "\"premarket\" movers stocks when:1h",
+    "FDA approval OR contract win shares when:1h",
+]
+
+state = {
+    "started": datetime.now(timezone.utc).isoformat(),
+    "last_cycle": None,
+    "sources": {},
+    "alerts_sent": [],
+    "universe_size": 0,
+    "universe_source": "",
+}
+seen = set()
+moved_today = {}  # ticker -> (date, highest bucket alerted)
+lock = threading.Lock()
+
+
+# ---------------------------------------------------------------- utilities
+def log(*a):
+    print(datetime.now(UK).strftime("%H:%M:%S"), *a, flush=True)
+
+
+def fetch(url, timeout=15, headers=None):
+    h = {"User-Agent": UA, "Accept": "*/*"}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def mark(source, ok, info=""):
+    state["sources"][source] = {
+        "ok": ok, "info": str(info)[:200],
+        "at": datetime.now(UK).strftime("%H:%M:%S"),
+    }
+
+
+def clean(s):
+    s = html.unescape(re.sub(r"<[^>]+>", " ", s or ""))
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def parse_date(s):
+    if not s:
+        return None
+    try:
+        d = parsedate_to_datetime(s)
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+
+def parse_rss(raw):
+    items = []
+    root = ET.fromstring(raw)
+    for it in root.iter("item"):
+        g = lambda tag: (it.findtext(tag) or "")
+        items.append({
+            "title": clean(g("title")),
+            "link": g("link").strip(),
+            "desc": clean(g("description"))[:600],
+            "date": parse_date(g("pubDate")),
+            "guid": (g("guid") or g("link")).strip(),
+            "source": clean(g("source")),
+        })
+    return items
+
+
+# ----------------------------------------------------------------- universe
+UNIVERSE = {}
+NAME_PATTERNS = []  # (regex, ticker)
+
+
+def short_name(name):
+    n = SUFFIX_RE.sub(" ", name)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+def build_patterns():
+    pats = []
+    for t, name in UNIVERSE.items():
+        if t in NAME_OVERRIDES:
+            aliases = NAME_OVERRIDES[t]
+        else:
+            sn = short_name(name)
+            aliases = [sn] if len(sn) >= 4 else []
+        for a in aliases:
+            strict = a.isupper() and len(a) <= 4
+            pats.append((re.compile(r"(?<![\w-])" + re.escape(a) + r"(?![\w-])",
+                                    0 if strict else re.I), t))
+    NAME_PATTERNS[:] = pats
+
+
+def load_universe():
+    base = json.load(open(os.path.join(HERE, "universe.json")))
+    src = "bundled list"
+    try:
+        raw = fetch("https://www.sp-funds.com/wp-content/uploads/data/"
+                    "TidalFG_Holdings_SPUS.csv", timeout=20).decode("utf-8", "ignore")
+        rows = list(csv.DictReader(io.StringIO(raw)))
+        fresh = {}
+        for r in rows:
+            keys = {k.lower().strip(): v for k, v in r.items() if k}
+            t = (keys.get("stockticker") or keys.get("ticker") or "").strip().upper()
+            n = (keys.get("securityname") or keys.get("name") or "").strip()
+            if t and n and re.fullmatch(r"[A-Z.]{1,6}", t):
+                fresh[t] = n
+        if len(fresh) > 100:
+            extras = {k: v for k, v in base.items()
+                      if k in ("ASML", "TSM", "CELH", "RIOT", "AAOI")}
+            base = {**fresh, **extras}
+            src = "SPUS live holdings"
+    except Exception as e:
+        log("SPUS refresh failed, using bundled list:", e)
+    for t in BDS_EXCLUDE:
+        base.pop(t, None)
+    UNIVERSE.clear()
+    UNIVERSE.update(base)
+    build_patterns()
+    state["universe_size"] = len(UNIVERSE)
+    state["universe_source"] = src
+    log(f"Universe: {len(UNIVERSE)} stocks ({src})")
+
+
+def match_tickers(text):
+    found = []
+    # Exchange tags like (NASDAQ: PTC) / NYSE:PTC
+    for m in re.finditer(r"(?:NASDAQ|Nasdaq|NYSE|NYSE American)\s*(?:GS|GM|CM)?\s*:\s*"
+                         r"([A-Z]{1,5}(?:\.[A-Z])?)", text):
+        if m.group(1) in UNIVERSE and m.group(1) not in found:
+            found.append(m.group(1))
+    for m in re.finditer(r"\$([A-Z]{1,5})\b", text):
+        if m.group(1) in UNIVERSE and m.group(1) not in found:
+            found.append(m.group(1))
+    for rx, t in NAME_PATTERNS:
+        if t not in found and rx.search(text):
+            found.append(t)
+    return found
+
+
+# ------------------------------------------------------------------- alerts
+def push(title, body, url=None, priority=4, tags="zap"):
+    if not NTFY_TOPIC:
+        log("NTFY_TOPIC not set; would push:", title, body)
+        return False
+    headers = {
+        "Title": title.encode("utf-8").decode("latin-1", "ignore")[:200],
+        "Priority": str(priority),
+        "Tags": tags,
+    }
+    if url:
+        headers["Click"] = url
+    req = urllib.request.Request(f"{NTFY_SERVER}/{NTFY_TOPIC}",
+                                 data=body.encode("utf-8"), headers=headers,
+                                 method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=15).read()
+        with lock:
+            state["alerts_sent"].insert(0, {
+                "at": datetime.now(UK).strftime("%a %H:%M"), "title": title})
+            del state["alerts_sent"][30:]
+        log("PUSHED:", title)
+        return True
+    except Exception as e:
+        log("push failed:", e)
+        return False
+
+
+def quote_line(t):
+    q = last_quotes.get(t)
+    if not q:
+        return ""
+    return f"{t} {q['pct']:+.1f}% (${q['price']:.2f})"
+
+
+def note_for(text):
+    if TAKEOVER_RE.search(text):
+        if re.search(r"report|talks|sources|people familiar|consider|explor", text, re.I):
+            return ("Takeover report, not confirmed yet - the deal could fall "
+                    "through. Most of the jump usually happens straight away.")
+        return ("Takeover/deal news - the stock usually trades just under the "
+                "offer price, so most of the gain has likely happened.")
+    return ""
+
+
+def alert_news(tickers, item, kind):
+    text = f"{item['title']} {item['desc']}"
+    for t in tickers[:2]:
+        key = ("news", t, re.sub(r"\W+", "", item["title"].lower())[:60])
+        if key in seen:
+            continue
+        seen.add(key)
+        q = last_quotes.get(t)
+        move = f" {q['pct']:+.1f}%" if q else ""
+        icon = "📉" if q and q["pct"] < 0 else "⚡"
+        title = f"{icon} {t}{move} - {UNIVERSE.get(t, '')[:40]}"
+        body = item["title"]
+        n = note_for(text)
+        if n:
+            body += f"\n{n}"
+        src = item.get("source") or kind
+        body += f"\n({src}) Check Musaffa/Zoya before buying. Not advice."
+        push(title, body, item["link"], priority=5 if TAKEOVER_RE.search(text) else 4)
+
+
+# ------------------------------------------------------------------ sources
+def fresh(item, minutes=90):
+    d = item["date"]
+    return d is None or d > datetime.now(timezone.utc) - timedelta(minutes=minutes)
+
+
+def poll_pr(initial=False):
+    for url in PR_FEEDS:
+        name = "PR:" + urllib.parse.urlparse(url).netloc
+        try:
+            items = parse_rss(fetch(url))
+            mark(name, True, f"{len(items)} items")
+        except Exception as e:
+            mark(name, False, e)
+            continue
+        for it in items:
+            gid = ("pr", it["guid"])
+            if gid in seen:
+                continue
+            seen.add(gid)
+            if initial or not fresh(it, 120):
+                continue
+            text = f"{it['title']} {it['desc']}"
+            tickers = [t for t in match_tickers(text)]
+            if tickers and CATALYST_RE.search(it["title"]):
+                it["source"] = "Press release"
+                alert_news(tickers, it, "press release")
+
+
+gn_index = [0]
+
+
+def poll_google(initial=False, queries=None):
+    qs = queries or [GN_QUERIES[gn_index[0] % len(GN_QUERIES)]]
+    gn_index[0] += 1
+    for q in qs:
+        url = ("https://news.google.com/rss/search?hl=en-US&gl=US&ceid=US:en&q="
+               + urllib.parse.quote(q))
+        try:
+            items = parse_rss(fetch(url))
+            mark("GoogleNews", True, f"{len(items)} items for: {q[:40]}")
+        except Exception as e:
+            mark("GoogleNews", False, e)
+            continue
+        for it in items:
+            gid = ("gn", re.sub(r"\W+", "", it["title"].lower())[:80])
+            if gid in seen:
+                continue
+            seen.add(gid)
+            if initial or not fresh(it, 75):
+                continue
+            # Google appends " - Source" to titles; match on the headline part.
+            head = re.sub(r"\s+-\s+[^-]{2,40}$", "", it["title"])
+            tickers = match_tickers(head)
+            if tickers and CATALYST_RE.search(head):
+                it["title"] = head
+                alert_news(tickers, it, "news")
+
+
+last_quotes = {}
+
+
+def yahoo_spark(symbols):
+    out = {}
+    err = "empty"
+    for host in ("query1", "query2"):
+        try:
+            url = (f"https://{host}.finance.yahoo.com/v8/finance/spark?"
+                   f"symbols={','.join(symbols)}&range=1d&interval=5m"
+                   f"&includePrePost=true")
+            data = json.loads(fetch(url))
+            for r in data.get("spark", {}).get("result", []) or []:
+                resp = (r.get("response") or [{}])[0]
+                meta = resp.get("meta", {})
+                closes = [c for c in (resp.get("indicators", {}).get("quote", [{}])[0]
+                                      .get("close") or []) if c]
+                prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+                price = closes[-1] if closes else meta.get("regularMarketPrice")
+                if prev and price:
+                    out[r["symbol"]] = {"price": price, "pct": (price / prev - 1) * 100}
+            if out:
+                return out
+        except Exception as e:
+            err = e
+    raise RuntimeError(f"spark failed: {err}")
+
+
+def latest_headline(ticker):
+    name = (NAME_OVERRIDES.get(ticker) or [short_name(UNIVERSE.get(ticker, ticker))])[0]
+    q = f"\"{name}\" stock when:1d"
+    url = ("https://news.google.com/rss/search?hl=en-US&gl=US&ceid=US:en&q="
+           + urllib.parse.quote(q))
+    try:
+        items = parse_rss(fetch(url))
+        items.sort(key=lambda i: i["date"] or datetime.min.replace(tzinfo=timezone.utc),
+                   reverse=True)
+        for it in items[:5]:
+            head = re.sub(r"\s+-\s+[^-]{2,40}$", "", it["title"])
+            if ticker in match_tickers(head) or name.lower() in head.lower():
+                return head, it["link"], it["source"]
+    except Exception:
+        pass
+    return None, None, None
+
+
+def poll_moves(initial=False):
+    syms = sorted(UNIVERSE)
+    got = {}
+    errors = 0
+    last_err = None
+    for i in range(0, len(syms), 20):
+        try:
+            got.update(yahoo_spark(syms[i:i + 20]))
+        except Exception as e:
+            errors += 1
+            last_err = e
+        time.sleep(0.3)
+    if got:
+        mark("PriceMoves", True, f"{len(got)} quotes, {errors} failed batches")
+    else:
+        mark("PriceMoves", False, last_err if errors else "no data")
+        return
+    last_quotes.update(got)
+    today = datetime.now(UK).date()
+    for t, q in got.items():
+        pct = q["pct"]
+        if abs(pct) < MOVE_PCT:
+            continue
+        bucket = int(abs(pct) // MOVE_PCT)  # re-alert at 8%, 16%, 24%...
+        prev = moved_today.get(t)
+        if prev and prev[0] == today and prev[1] >= bucket:
+            continue
+        moved_today[t] = (today, bucket)
+        if initial:
+            continue
+        head, link, src = latest_headline(t)
+        icon = "🚀" if pct > 0 else "📉"
+        title = f"{icon} {t} {pct:+.1f}% - {UNIVERSE[t][:40]}"
+        body = (f"Now ${q['price']:.2f}. "
+                + (f"Likely why: {head}" if head else "No headline found yet."))
+        n = note_for(head or "")
+        if n:
+            body += f"\n{n}"
+        body += "\nCheck Musaffa/Zoya before buying. Not advice."
+        push(title, body, link, priority=5 if abs(pct) >= 15 else 4,
+             tags="chart_with_upwards_trend" if pct > 0 else "chart_with_downwards_trend")
+
+
+# --------------------------------------------------------------- schedule
+def active_now():
+    n = datetime.now(UK)
+    if n.weekday() >= 5:
+        return False
+    return (n.hour, n.minute) >= (6, 0) and (n.hour, n.minute) <= (22, 30)
+
+
+def keepalive():
+    while True:
+        time.sleep(600)
+        if SELF_URL and active_now():
+            try:
+                fetch(SELF_URL + "/health", timeout=20)
+            except Exception:
+                pass
+
+
+def loop():
+    load_universe()
+    log("Warm-up pass (marking existing news as seen)...")
+    for fn, kw in ((poll_pr, {}), (poll_google, {"queries": GN_QUERIES}), (poll_moves, {})):
+        try:
+            fn(initial=True, **kw)
+        except Exception:
+            traceback.print_exc()
+    push("✅ Halal news watcher is running",
+         f"Watching {len(UNIVERSE)} halal stocks ({state['universe_source']}). "
+         f"Alerts for takeovers, big news and {MOVE_PCT:.0f}%+ moves, "
+         "weekdays 06:00-22:30 UK.", priority=3, tags="white_check_mark")
+    tick = 0
+    last_day = datetime.now(UK).date()
+    while True:
+        start = time.time()
+        try:
+            if datetime.now(UK).date() != last_day:
+                last_day = datetime.now(UK).date()
+                load_universe()
+                moved_today.clear()
+                if len(seen) > 50000:
+                    seen.clear()
+            if active_now():
+                poll_pr()                    # every ~20s
+                poll_google()                # one query per cycle, rotating
+                if tick % 3 == 0:
+                    poll_moves()             # every ~60s
+            state["last_cycle"] = datetime.now(UK).strftime("%a %H:%M:%S")
+        except Exception:
+            traceback.print_exc()
+        tick += 1
+        time.sleep(max(5, 20 - (time.time() - start)))
+
+
+# ------------------------------------------------------------------ web
+class H(BaseHTTPRequestHandler):
+    def _send(self, code, obj):
+        b = json.dumps(obj, indent=2, default=str).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self):
+        p = urllib.parse.urlparse(self.path)
+        if p.path == "/test":
+            qs = urllib.parse.parse_qs(p.query)
+            if qs.get("topic", [""])[0] != NTFY_TOPIC:
+                return self._send(403, {"error": "pass ?topic=<your topic>"})
+            ok = push("⚡ PTC +35.7% - TEST alert",
+                      "Schneider Electric reportedly close to a $20B takeover of PTC.\n"
+                      "This is a test so you know alerts reach your phone.",
+                      "https://www.trading212.com", priority=4)
+            return self._send(200, {"sent": ok})
+        self._send(200, {"status": "ok", "active_hours_now": active_now(), **state})
+
+    def log_message(self, *a):
+        pass
+
+
+if __name__ == "__main__":
+    threading.Thread(target=loop, daemon=True).start()
+    threading.Thread(target=keepalive, daemon=True).start()
+    port = int(os.environ.get("PORT", "10000"))
+    log("HTTP on", port)
+    HTTPServer(("0.0.0.0", port), H).serve_forever()
