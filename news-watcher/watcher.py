@@ -847,6 +847,13 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = urllib.parse.urlparse(self.path)
+        if p.path == "/robots.txt":
+            b = b"User-agent: *\nAllow: /\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b)
+            return
         if p.path == "/debug":
             qs = urllib.parse.parse_qs(p.query)
             if qs.get("topic", [""])[0] != NTFY_TOPIC:
